@@ -1,0 +1,4 @@
+python3 client.py Chris
+python3 client.py Akis
+
+python3 group_manager.py 50001
