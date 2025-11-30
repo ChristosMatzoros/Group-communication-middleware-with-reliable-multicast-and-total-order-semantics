@@ -21,6 +21,7 @@ packets_list = []
 application_messages_list = []
 msgids_list = []
 send_list = []
+threads_started = [False]
 
 # Locks
 mutex = threading.Lock()

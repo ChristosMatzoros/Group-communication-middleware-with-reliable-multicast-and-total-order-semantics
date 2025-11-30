@@ -10,6 +10,7 @@ import threading
 import sys
 import signal
 from shared.color import Color
+from middleware.utils import get_default_ip  
 
 # -----------------------------
 # GLOBAL STATE
@@ -50,16 +51,23 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 
 
-# -----------------------------
+# -------------------------------------------------------------
 # UDP DISCOVERY SOCKET
-# -----------------------------
+# -------------------------------------------------------------
 udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
 udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-udp_socket.bind(('', 4242))
+udp_socket.bind(("", 4242))
 
-mreq = struct.pack("=4sl", socket.inet_aton("224.51.105.104"), socket.INADDR_ANY)
+local_ip = get_default_ip()
+print(f"[DEBUG] Manager using interface IP: {local_ip}")
+
+# 🔥 FIX: multicast group JOIN – ALWAYS use `4sl` and `INADDR_ANY`
+mreq = struct.pack(
+    "=4sl", 
+    socket.inet_aton("224.51.105.104"), 
+    socket.INADDR_ANY
+)
 udp_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-
 
 # -----------------------------------------------------------
 # UDP Discovery Listener  → Handles ["DISCOVER", myid]
