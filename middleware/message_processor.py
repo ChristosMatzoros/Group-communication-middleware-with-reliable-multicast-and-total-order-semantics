@@ -1,13 +1,18 @@
 # middleware/message_processor.py
 
 import copy
+import time
 import middleware.state as st
 from middleware.reliability import multicast_sender
-import time
+
 
 def application_message_processor():
     while True:
         time.sleep(0.01)
+
+        # -----------------------
+        # FETCH NEXT PACKET
+        # -----------------------
         st.packets_list_mutex.acquire()
         if not st.packets_list:
             st.packets_list_mutex.release()
@@ -16,104 +21,105 @@ def application_message_processor():
         packet = st.packets_list.pop(0)
         st.packets_list_mutex.release()
 
-        msg = copy.copy(packet[2])    # TRM-MSG or TRM-SEQ
-        pid_k = copy.copy(packet[1])  # ['Chris', 1]
-        group = copy.copy(packet[3][0])  # CORRECT group lookup
+        msg     = packet[2]          # TRM-MSG or TRM-SEQ
+        pid_k   = packet[1]          # ['sender', seqno] or ['sender', seqno, 'SEQ']
+        state   = packet[3]          # the state object passed by listener
+        group   = state[0]
 
-        # ----------------- FIND STATE -----------------
+        sender  = pid_k[0]
+        seqno   = pid_k[1]
+        mtype   = msg[0]             # "TRM-MSG" or "TRM-SEQ"
+
+        # UNIQUE message id (fix for duplicates)
+        msg_id = (sender, seqno, mtype)
+
+        # -----------------------
+        # DUPLICATE FILTER
+        # -----------------------
         st.states_list_mutex.acquire()
-        state = None
-        for s in st.states_list:
-            if s[0] == group:
-                state = s
-                break
-        st.states_list_mutex.release()
-        if state is None:
+        if msg_id in state[5]:
+            st.states_list_mutex.release()
             continue
-
-        curr_pid = copy.copy(pid_k)
-        if len(curr_pid) == 3:
-            curr_pid.remove("SEQ")
-
-        # ----------------- DUPLICATE -----------------
-        found = False
-        st.states_list_mutex.acquire()
-        for msgid in state[5]:
-            if msgid == curr_pid:
-                found = True
-                break
-        if not found:
-            state[5].append(curr_pid)
+        state[5].append(msg_id)
         st.states_list_mutex.release()
 
-        if found:
-            continue
-
-        # ----------------- RESEND IF NOT ORIGINAL SENDER -----------------
-        if pid_k[0] != st.id[0] and msg[0] == "TRM-MSG":
+        # -----------------------
+        # REBROADCAST (gossip)
+        # -----------------------
+        if sender != st.id[0] and mtype == "TRM-MSG":
             multicast_sender(state, pid_k, msg)
 
-        # ----------------- SEQUENCER CASE -----------------
-        is_seq = (state[4][0] == st.id[0])   # if I'm the first member
-        if is_seq and msg[0] == "TRM-MSG":
+        # -----------------------
+        # SEQUENCER LOGIC
+        # -----------------------
+        is_sequencer = (state[4][0] == st.id[0])
+
+        if is_sequencer and mtype == "TRM-MSG":
+            # assign sequence number
             st.states_list_mutex.acquire()
             state[8] += 1
             order_no = state[8]
             st.states_list_mutex.release()
 
-            msg[1].append("SEQ")
-            seq_packet = ["TRM-SEQ", msg[1], order_no]
-            multicast_sender(state, msg[1], seq_packet)
+            # broadcast TRM-SEQ
+            seq_pid = [sender, seqno, "SEQ"]
+            seq_pkt = ["TRM-SEQ", seq_pid, order_no]
+            multicast_sender(state, seq_pid, seq_pkt)
 
-            # SENDER should also see the message in GREEN:
-            payload_only = msg[2]   # safe when sequencer
+            # deliver to APP immediately (green)
             st.application_messages_list_mutex.acquire()
-            st.application_messages_list.append(["APP", payload_only, state[1]])
+            st.application_messages_list.append(["APP", msg[2], state[1]])
             st.application_messages_list_mutex.release()
 
-            continue   # 🚨 THIS SAVES YOU FROM NON-SEQUENCER CODE BELOW
+            continue  # don't execute non-sequencer path
 
-        # ----------------- NON-SEQUENCER: WAIT -----------------
-
+        # -------------------------------------------------
+        # NON-SEQUENCER: store MSG + SEQ in pending buffer
+        # -------------------------------------------------
         st.states_list_mutex.acquire()
+        pending = state[7]
         found = False
-        for item in state[7]:
-            if item[0] == msg[1]:
-                if msg[0] == "TRM-MSG":
-                    item[2] = msg[2]
-                elif msg[0] == "TRM-SEQ":
-                    item[1] = msg[2]
+
+        for item in pending:
+            if item[0][0] == sender and item[0][1] == seqno:
+                # existing entry
+                if mtype == "TRM-MSG":
+                    item[2] = msg[2]      # payload text
+                else:  # TRM-SEQ
+                    item[1] = msg[2]      # global order number
                 found = True
                 break
 
         if not found:
-            if msg[0] == "TRM-MSG":
-                state[7].append([msg[1], -1, msg[2]])
-            elif msg[0] == "TRM-SEQ":
-                state[7].append([msg[1], msg[2], ""])
+            if mtype == "TRM-MSG":
+                pending.append([[sender, seqno], -1, msg[2]])
+            else:
+                pending.append([[sender, seqno], msg[2], ""])
+
         st.states_list_mutex.release()
 
-        # try deliver in order
+        # -------------------------------------------------
+        # TRY DELIVERY (total order)
+        # -------------------------------------------------
         while True:
             st.states_list_mutex.acquire()
             delivered = False
-            for item in state[7]:
-                if item[1] != -1 and item[2] != "" and item[1] == state[6] + 1:
-                    state[7].remove(item)
+            for item in list(pending):
+                pid, order_no, payload = item
+
+                if order_no != -1 and payload != "" and order_no == state[6] + 1:
+                    # deliver now
+                    pending.remove(item)
                     state[6] += 1
 
-                    # extract correct payload
-                    payload_only = item[2]
-                    if isinstance(payload_only, list) and len(payload_only) == 3:
-                        payload_only = payload_only[2]
-
-                    # append safely
                     st.application_messages_list_mutex.acquire()
-                    st.application_messages_list.append(["APP", payload_only, state[1]])
+                    st.application_messages_list.append(["APP", payload, state[1]])
                     st.application_messages_list_mutex.release()
 
                     delivered = True
                     break
+
             st.states_list_mutex.release()
+
             if not delivered:
                 break
